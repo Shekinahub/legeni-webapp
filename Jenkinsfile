@@ -1,16 +1,16 @@
-// Pipeline de référence du TP 3.5 : tests -> build -> test d'acceptance -> push
 pipeline {
     agent any
 
     parameters {
-        string(name: 'DOCKERHUB_ID', defaultValue: 'legeni07', description: 'DockerHub ID')
-        booleanParam(name: 'PUSH', defaultValue: false, description: 'Push to DockerHub')
+        string(name: 'DOCKERHUB_ID', defaultValue: 'legeni07', description: 'Votre identifiant Docker Hub')
+        booleanParam(name: 'PUSH', defaultValue: true, description: "Pousser l'image sur Docker Hub")
     }
 
     environment {
         IMAGE          = "${params.DOCKERHUB_ID}/legeni-webapp"
-        VERSION        = "1.0.${env.BUILD_NUMBER}"
-        PROJECT_PATH   = "/workspace-repo/app-fil-rouge"
+        VERSION        = "${env.BRANCH_NAME == 'main' ? '1.0.' + env.BUILD_NUMBER : (env.BRANCH_NAME ?: 'local').replaceAll('[^a-zA-Z0-9.-]', '-') + '-' + env.BUILD_NUMBER}"
+        TEST_CONTAINER = "webapp-ci-${env.BUILD_NUMBER}"
+        CI_NETWORK     = "ci-net-${env.BUILD_NUMBER}"
     }
 
     options {
@@ -20,46 +20,56 @@ pipeline {
     }
 
     stages {
-        stage('Qualité & Tests en Parallèle') {
-            parallel {
-                stage('Linter Flake8') {
-                    steps {
-                        echo "Lancement de Flake8..."
-                        sh 'docker build --target test -t legeni-webapp:test ${PROJECT_PATH}'
-                    }
-                }
-                stage('Tests Unitaires Pytest') {
-                    steps {
-                        echo "Lancement de Pytest..."
-                        // Vous pouvez cibler ou lancer les tests ici
-                        sh 'docker build --target test -t legeni-webapp:test ${PROJECT_PATH}'
-                    }
-                }
+        stage('Tests unitaires') {
+            steps {
+                sh 'docker build --target test -t legeni-webapp:test .'
             }
         }
 
         stage('Build image') {
             steps {
-                sh 'docker build --build-arg APP_VERSION=$VERSION -t ${IMAGE}:${VERSION} ${PROJECT_PATH}'
+                sh 'docker build --build-arg APP_VERSION=$VERSION -t $IMAGE:$VERSION -t $IMAGE:latest .'
             }
         }
 
-        stage('Test d\'acceptance') {
+        stage("Test d'acceptance") {
             steps {
-                echo "Tests d'acceptance validés"
+                sh '''
+                    docker network create $CI_NETWORK
+                    docker run -d --name $TEST_CONTAINER --network $CI_NETWORK $IMAGE:$VERSION
+                    docker run --rm --network $CI_NETWORK curlimages/curl:8.11.1 \
+                        -sf --retry 10 --retry-connrefused --retry-delay 1 http://$TEST_CONTAINER:5000/health
+                    docker run --rm --network $CI_NETWORK curlimages/curl:8.11.1 \
+                        -sf http://$TEST_CONTAINER:5000/ | grep -q "Version $VERSION"
+                '''
+            }
+        }
+
+        stage('Push Docker Hub') {
+            when { branch 'main' }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub',
+                                                  usernameVariable: 'DH_USER',
+                                                  passwordVariable: 'DH_TOKEN')]) {
+                    sh '''
+                        echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+                        docker push "$DH_USER/legeni-webapp:$VERSION" || docker push $IMAGE:$VERSION
+                        docker push "$DH_USER/legeni-webapp:latest" || docker push $IMAGE:latest
+                    '''
+                }
             }
         }
     }
 
     post {
         always {
-            echo "Nettoyage terminé."
+            sh 'docker rm -f $TEST_CONTAINER || true; docker network rm $CI_NETWORK || true'
         }
         success {
-            echo "Pipeline parallèle exécuté avec SUCCÈS !"
+            echo "Image ${IMAGE}:${VERSION} construite et validée"
         }
         failure {
-            echo "Échec détecté dans le pipeline."
+            echo "Échec du pipeline : consultez la console de l'étape en rouge"
         }
     }
 }
